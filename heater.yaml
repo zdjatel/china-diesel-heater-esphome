@@ -1,0 +1,275 @@
+substitutions:
+  tx_repeats: "3"       # how many times to repeat the command (the heater reacts to the first frame)
+  tx_delay_ms: "12"     # delay after the end of the heater reply before sending our frame
+
+esphome:
+  name: garage-heater-direct
+
+esp32:
+  board: nodemcu-32s
+  framework:
+    type: esp-idf
+
+api:
+
+ota:
+- platform: esphome
+  password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: none
+
+logger:
+  level: INFO
+
+globals:
+  - id: g_tx_cmd        # 0 = none, 0x5A = ON, 0x5C = OFF
+    type: int
+    initial_value: '0'
+  - id: g_tx_left       # frames still to send
+    type: int
+    initial_value: '0'
+  - id: g_tx_t0         # when the button was pressed (millis)
+    type: uint32_t
+    initial_value: '0'
+  - id: g_state         # last heater state byte p[3]
+    type: int
+    initial_value: '-1'
+  - id: g_err           # last heater error byte p[4]
+    type: int
+    initial_value: '-1'
+
+uart:
+  id: bus
+  rx_pin: GPIO16
+  tx_pin: GPIO17        # via a diode: cathode (stripe) to GPIO17, anode to the DATA line
+  baud_rate: 7500
+  parity: NONE
+  stop_bits: 1
+  rx_buffer_size: 512
+
+switch:
+  - platform: template
+    id: heater_control_enable
+    name: "Heater Control Enable"
+    icon: mdi:shield-lock-open
+    optimistic: true
+    restore_mode: ALWAYS_OFF   # control is always disabled after a reboot
+
+button:
+  - platform: template
+    name: "Heater Start"
+    icon: mdi:fire
+    on_press:
+      - lambda: |-
+          if (!id(heater_control_enable).state) {
+            ESP_LOGW("tx", "START rejected: Heater Control Enable is off");
+            return;
+          }
+          if (!((id(g_state) == 0 || id(g_state) == 8) && (id(g_err) == 0 || id(g_err) == 1))) {
+            ESP_LOGW("tx", "START rejected: state %d, error %d", id(g_state), id(g_err));
+            return;
+          }
+          id(g_tx_cmd) = 0x5A;
+          id(g_tx_left) = ${tx_repeats};
+          id(g_tx_t0) = millis();
+
+  - platform: template
+    name: "Heater Stop"
+    icon: mdi:fire-off
+    on_press:
+      - lambda: |-
+          // STOP is always allowed, even when Control Enable is off
+          id(g_tx_cmd) = 0x5C;
+          id(g_tx_left) = ${tx_repeats};
+          id(g_tx_t0) = millis();
+
+sensor:
+  - platform: template
+    id: heater_voltage
+    name: "Heater voltage"
+    unit_of_measurement: "V"
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 1
+
+  - platform: template
+    id: heater_vent_speed
+    name: "Heater Vent speed"
+    unit_of_measurement: "%"
+    state_class: measurement
+    accuracy_decimals: 0
+
+  - platform: template
+    id: heater_current_temp
+    name: "Heater Current temp"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 0
+
+  - platform: template
+    id: heater_backflow_temp
+    name: "Heater Back flow temp"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 0
+
+  - platform: template
+    id: heater_flame_temp
+    name: "Heater Flame temp"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 0
+
+  - platform: wifi_signal
+    name: "Heater WiFi signal"
+    update_interval: 60s
+    entity_category: diagnostic
+
+  - platform: uptime
+    name: "Heater uptime"
+    update_interval: 60s
+    entity_category: diagnostic
+
+text_sensor:
+  - platform: template
+    id: heater_state
+    name: "Heater State"
+
+  - platform: template
+    id: heater_error
+    name: "Heater Error"
+
+  - platform: wifi_info
+    ip_address:
+      name: "Heater IP"
+      entity_category: diagnostic
+    bssid:
+      name: "Heater BSSID"
+      entity_category: diagnostic
+
+interval:
+  - interval: 5ms
+    then:
+      - lambda: |-
+          static std::vector<uint8_t> f, pending, calm;
+          static uint32_t last = 0, last_tx = 0;
+          static uint8_t calmK = 0;
+
+          uint8_t b;
+          while (id(bus).available() && id(bus).read_byte(&b)) {
+            if (f.size() < 128) f.push_back(b);
+            last = millis();
+          }
+          if (f.empty() && !pending.empty()) { f = pending; pending.clear(); last = millis() - 100; }
+          if (f.empty() || (millis() - last) < 15) return;
+
+          auto crc16 = [](const uint8_t *d, size_t len) {
+            uint16_t c = 0xFFFF;
+            for (size_t i = 0; i < len; i++) {
+              c ^= d[i];
+              for (int k = 0; k < 8; k++) c = (c & 1) ? (c >> 1) ^ 0xA001 : (c >> 1);
+            }
+            return c;
+          };
+
+          size_t n = f.size();
+          // the heater reply and the remote frame can arrive back-to-back and merge: split them
+          if (n == 62) {
+            size_t cut = (f[0] == 0x6A && f[36] == 0xA6) ? 36 : ((f[0] == 0xA6 && f[26] == 0x6A) ? 26 : 0);
+            if (cut) { pending.assign(f.begin() + cut, f.end()); f.resize(cut); n = cut; }
+          }
+
+          // frame: 6A (36 bytes, heater reply) or A6 (26 bytes, remote command); length byte = n-2, CRC16 Modbus big-endian
+          bool is6A = (n == 36 && f[0] == 0x6A);
+          bool isA6 = (n == 26 && f[0] == 0xA6);
+          bool ok = (is6A || isA6) && f[1] == n - 2 &&
+                    crc16(f.data(), n - 2) == (uint16_t)((f[n - 2] << 8) | f[n - 1]);
+          // masking key K = f[18]; the "empty" bytes repeat it
+          uint8_t K = ok ? f[18] : 0;
+          if (ok) ok = is6A ? (f[20] == K && f[22] == K && f[23] == K && f[27] == K)
+                            : (f[21] == K && f[22] == K);
+          if (!ok) { f.clear(); return; }
+
+          uint8_t p[36] = {0};
+          for (size_t i = 2; i + 2 < n; i++) p[i] = f[i] ^ K;
+          f.clear();
+
+          if (isA6) {
+            if (p[3] == 0) { calm.assign(p, p + 26); calmK = K; }
+            return;
+          }
+
+          // ---- heater frame ----
+          id(g_state) = p[3];
+          id(g_err) = p[4];
+
+          static int ls = -1, le = -1, l19 = -1, l25 = -1, l21 = -1, l6 = -1, l10 = -1;
+
+          if (p[3] != ls) {
+            ls = p[3];
+            const char *s;
+            switch (ls) {
+              case 0: case 8: s = "OFF"; break;
+              case 1: s = "ON"; break;
+              case 2: s = "Process starting..."; break;
+              case 4: s = "Burn-up completed successfully."; break;
+              case 5: s = "Heater operating normally."; break;
+              case 7: s = "Stopping, cooling down..."; break;
+              default: s = nullptr;
+            }
+            id(heater_state).publish_state(s ? std::string(s) : "Unknown (" + std::to_string(ls) + ")");
+          }
+
+          // p[4]: 0 = standby, 1 = no error, n >= 2 = E-(n-1)
+          if (p[4] != le) {
+            le = p[4];
+            static const char *const ERR[14] = {
+              "Supply undervoltage", "The power overvoltage", "Ignition plug fault", "Oil pump failure",
+              "The machine is overheating", "Fan motor fault", "Communication failure",
+              "The flame is extinguished", "The flame temperature sensor is faulty", "Ignition failure",
+              "The water circulating pump is fault", "Poor circulation in waterways",
+              "Water temperature sensor fault", "The heating temperature sensor is faulty"};
+            char eb[80];
+            if (le == 0) snprintf(eb, sizeof(eb), "Standby");
+            else if (le == 1) snprintf(eb, sizeof(eb), "No error");
+            else if (le <= 15) snprintf(eb, sizeof(eb), "E-%02d: %s", le - 1, ERR[le - 2]);
+            else snprintf(eb, sizeof(eb), "E-%02d (code %d)", le - 1, le);
+            id(heater_error).publish_state(eb);
+          }
+
+          if (p[19] != l19) { l19 = p[19]; id(heater_current_temp).publish_state(l19); }
+          if (p[25] != l25) { l25 = p[25]; id(heater_backflow_temp).publish_state(l25); }
+          if (p[21] != l21) { l21 = p[21]; id(heater_flame_temp).publish_state(l21); }
+          if (p[6]  != l6)  { l6  = p[6];  id(heater_voltage).publish_state(l6 * 0.1f); }
+          if (p[10] != l10) {
+            l10 = p[10];
+            float pct = l10 * 100.0f / 78.0f;     // 0 -> 0 %, 78 -> 100 %
+            id(heater_vent_speed).publish_state(pct > 100.0f ? 100.0f : pct);
+          }
+
+          // ---- send the command right after the heater reply, in the gap before the next remote frame ----
+          if (id(g_tx_left) > 0) {
+            if (millis() - id(g_tx_t0) > 8000) {
+              ESP_LOGW("tx", "command cancelled: timeout");
+              id(g_tx_left) = 0; id(g_tx_cmd) = 0;
+            } else if (millis() - last_tx < 200) {
+              // this is the heater reply to our own frame: do not answer it
+            } else if (calm.size() == 26) {
+              delay(${tx_delay_ms});
+              uint8_t out[26];
+              out[0] = 0xA6; out[1] = 24;
+              for (size_t i = 2; i < 24; i++)
+                out[i] = ((i == 3) ? (uint8_t) id(g_tx_cmd) : calm[i]) ^ calmK;
+              uint16_t c = crc16(out, 24);
+              out[24] = c >> 8; out[25] = c & 0xFF;
+              id(bus).write_array(out, 26);
+              last_tx = millis();
+              if (--id(g_tx_left) == 0) id(g_tx_cmd) = 0;
+            }
+          }
