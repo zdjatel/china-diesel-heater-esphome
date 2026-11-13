@@ -1,0 +1,481 @@
+substitutions:
+  log_remote: "true"    # "false" disables the button/remote listener log ([remote])
+  log_diff: "true"      # "false" отключает построчный лог изменений кадров (proto), если он мешает
+  tx_repeats: "3"       # сколько раз повторить команду (котёл реагирует уже на первый кадр)
+  tx_delay_ms: "12"     # пауза после конца ответа котла перед отправкой нашего кадра
+
+esphome:
+  name: garage-heater-direct
+
+esp32:
+  board: nodemcu-32s
+  framework:
+    type: esp-idf
+
+# Enable Home Assistant API
+api:
+
+# Allow Over-The-Air updates
+ota:
+- platform: esphome
+  password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: none     # против «засыпания» платы
+  # manual_ip:              # по желанию: фиксированный адрес
+  #   static_ip: 192.168.1.50
+  #   gateway: 192.168.1.1
+  #   subnet: 255.255.255.0
+
+logger:
+  level: DEBUG
+
+time:
+  - platform: homeassistant
+    id: ha_time
+
+globals:
+  - id: g_tx_cmd        # 0 = нет, 0x5A = ON, 0x5C = OFF
+    type: int
+    initial_value: '0'
+  - id: g_tx_left       # сколько кадров ещё отправить
+    type: int
+    initial_value: '0'
+  - id: g_tx_t0         # когда нажата кнопка (millis)
+    type: uint32_t
+    initial_value: '0'
+  - id: g_state         # последний p[3] котла
+    type: int
+    initial_value: '-1'
+  - id: g_err           # последний p[4] котла
+    type: int
+    initial_value: '-1'
+
+uart:
+  id: bus
+  rx_pin: GPIO16
+  tx_pin: GPIO17        # через диод: катод (полоска) к GPIO17, анод на линию DATA
+  baud_rate: 7500
+  parity: NONE
+  stop_bits: 1
+  rx_buffer_size: 512
+
+switch:
+  - platform: template
+    id: heater_control_enable
+    name: "Heater Control Enable"
+    icon: mdi:shield-lock-open
+    optimistic: true
+    restore_mode: ALWAYS_OFF   # после перезагрузки управление всегда выключено
+
+button:
+  - platform: restart
+    name: "Heater ESP32 Restart"
+    icon: mdi:restart
+    entity_category: diagnostic
+
+  - platform: template
+    name: "Heater Start"
+    icon: mdi:fire
+    on_press:
+      - lambda: |-
+          if (!id(heater_control_enable).state) {
+            ESP_LOGW("tx", "START отклонён: Heater Control Enable выключен");
+            return;
+          }
+          // a latched error (e.g. E-10) does not block START: the heater clears it on ON
+          if (!(id(g_state) == 0 || id(g_state) == 8)) {
+            ESP_LOGW("tx", "START отклонён: котёл не в состоянии OFF (p3=%d)", id(g_state));
+            return;
+          }
+          id(g_tx_cmd) = 0x5A;
+          id(g_tx_left) = ${tx_repeats};
+          id(g_tx_t0) = millis();
+          ESP_LOGI("tx", "START поставлен в очередь");
+
+  - platform: template
+    name: "Heater Stop"
+    icon: mdi:fire-off
+    on_press:
+      - lambda: |-
+          // СТОП разрешён всегда, даже при выключенном Control Enable
+          id(g_tx_cmd) = 0x5C;
+          id(g_tx_left) = ${tx_repeats};
+          id(g_tx_t0) = millis();
+          ESP_LOGI("tx", "STOP поставлен в очередь");
+
+number:
+  - platform: template
+    id: heater_gear_set
+    name: "Heater Gear"
+    icon: mdi:gauge
+    # передача (1..9), отправляется вместе с Start
+    min_value: 1
+    max_value: 9
+    step: 1
+    mode: slider
+    optimistic: true
+    restore_value: true
+    initial_value: 5
+
+  - platform: template
+    id: heater_timer_set
+    name: "Heater Timer"
+    icon: mdi:timer-outline
+    # таймер, мин (0..90, шаг 10), отправляется вместе с Start
+    unit_of_measurement: "min"
+    min_value: 0
+    max_value: 90
+    step: 10
+    mode: slider
+    optimistic: true
+    restore_value: true
+    initial_value: 40
+
+sensor:
+  - platform: template
+    id: heater_voltage
+    name: "Heater voltage"
+    unit_of_measurement: "V"
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 1
+
+  - platform: template
+    id: heater_vent_speed
+    name: "Heater Vent speed"
+    unit_of_measurement: "%"
+    state_class: measurement
+    accuracy_decimals: 0
+
+  - platform: template
+    id: heater_current_temp
+    name: "Heater Current temp"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 0
+
+  - platform: template
+    id: heater_backflow_temp
+    name: "Heater Back flow temp"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 0
+
+  - platform: template
+    id: heater_flame_temp
+    name: "Heater Flame temp"
+    unit_of_measurement: "°C"
+    state_class: measurement
+    accuracy_decimals: 0
+
+  - platform: template
+    id: heater_fan_raw
+    name: "Heater Fan speed (p7:p8)"
+    state_class: measurement
+    accuracy_decimals: 0
+    filters:
+      - throttle_average: 5s
+
+  - platform: template
+    id: heater_timer_remaining
+    name: "Heater Timer remaining"
+    unit_of_measurement: "min"
+    device_class: duration
+    state_class: measurement
+    accuracy_decimals: 0
+    icon: mdi:timer-sand
+
+  - platform: wifi_signal
+    name: "Heater WiFi signal"
+    update_interval: 60s
+    entity_category: diagnostic
+
+  - platform: uptime
+    name: "Heater uptime"
+    update_interval: 60s
+    entity_category: diagnostic
+
+text_sensor:
+  - platform: template
+    id: heater_state
+    name: "Heater State"
+
+  - platform: template
+    id: heater_error
+    name: "Heater Error"
+
+  - platform: wifi_info
+    ip_address:
+      name: "Heater IP"
+      entity_category: diagnostic
+    bssid:
+      name: "Heater BSSID"
+      entity_category: diagnostic
+
+interval:
+  - interval: 5ms
+    then:
+      - lambda: |-
+          static std::vector<uint8_t> f;
+          static std::vector<uint8_t> prev[2];
+          static uint32_t last = 0, total = 0, good = 0;
+          static std::vector<uint8_t> calm;   // последняя «спокойная» полезная нагрузка пульта (p[3]=0)
+          static uint8_t calmK = 0;
+          static std::vector<uint8_t> pending;   // хвост склеенного кадра (6A+A6 без паузы)
+          static uint32_t last_tx = 0;
+          static std::vector<uint8_t> prevA6;      // last remote payload (for the button listener)
+          static uint32_t lastA6change = 0;
+          const bool LOG_DIFF = ${log_diff};
+          const bool LOG_REMOTE = ${log_remote};
+
+          uint8_t b;
+          while (id(bus).available() && id(bus).read_byte(&b)) {
+            if (f.size() < 128) f.push_back(b);
+            last = millis();
+          }
+          if (f.empty() && !pending.empty()) { f = pending; pending.clear(); last = millis() - 100; }
+          if (f.empty() || (millis() - last) < 15) return;
+
+          size_t n = f.size();
+          // после нашей отправки ответ котла и кадр пульта идут впритык (пауза < 15 мс) и склеиваются: режем
+          if (n == 62) {
+            size_t cut = (f[0] == 0x6A && f[36] == 0xA6) ? 36 : ((f[0] == 0xA6 && f[26] == 0x6A) ? 26 : 0);
+            if (cut) {
+              pending.assign(f.begin() + cut, f.end());
+              f.resize(cut);
+              n = cut;
+            }
+          }
+          auto crc16 = [](const uint8_t *d, size_t len) {
+            uint16_t c = 0xFFFF;
+            for (size_t i = 0; i < len; i++) {
+              c ^= d[i];
+              for (int k = 0; k < 8; k++) c = (c & 1) ? (c >> 1) ^ 0xA001 : (c >> 1);
+            }
+            return c;
+          };
+          auto hexs = [](const uint8_t *d, size_t len) {
+            std::string s; char t[4];
+            for (size_t i = 0; i < len; i++) { snprintf(t, sizeof(t), "%02X ", d[i]); s += t; }
+            return s;
+          };
+
+          // --- проверка кадра: длина = n-2, CRC16 Modbus (big-endian) ---
+          total++;
+          bool lenok = n >= 6 && f[1] == n - 2;
+          bool crcok = false;
+          if (n >= 6) {
+            uint16_t c = crc16(f.data(), n - 2);
+            crcok = (c == (uint16_t)((f[n-2] << 8) | f[n-1]));
+          }
+          if (!(lenok && crcok)) {
+            ESP_LOGW("proto", "bad frame n=%u [%s]", (unsigned) n, hexs(f.data(), n).c_str());
+            f.clear();
+            return;
+          }
+          good++;
+
+          bool is6A = (f[0] == 0x6A && n == 36);   // ответ котла
+          bool isA6 = (f[0] == 0xA6 && n == 26);   // команда пульта
+          if (!is6A && !isA6) {
+            ESP_LOGW("proto", "unknown frame n=%u [%s]", (unsigned) n, hexs(f.data(), n).c_str());
+            f.clear();
+            return;
+          }
+
+          // --- расшифровка: ключ K = «пустой» байт f[18] ---
+          uint8_t K = f[18];
+          bool pad_ok = is6A ? (f[20] == K && f[22] == K && f[23] == K && f[27] == K)
+                             : (f[21] == K && f[22] == K);
+          if (!pad_ok) {
+            ESP_LOGW("proto", "ключ не подтверждён: [%s]", hexs(f.data(), n).c_str());
+            f.clear();
+            return;
+          }
+
+          std::vector<uint8_t> p(n, 0);
+          for (size_t i = 2; i + 2 < n; i++) p[i] = f[i] ^ K;
+
+          if (isA6 && p[3] == 0) { calm = p; calmK = K; }
+          if (is6A) { id(g_state) = p[3]; id(g_err) = p[4]; }
+
+          // --- remote listener: every change in the remote's A6 frame (buttons / settings), unmasked ---
+          if (isA6 && LOG_REMOTE) {
+            if (prevA6.empty()) {
+              ESP_LOGI("remote", "first A6 p=[%s]", hexs(&p[2], n - 4).c_str());
+              prevA6 = p;
+              lastA6change = millis();
+            } else if (p != prevA6) {
+              std::string d; char tmp[24];
+              for (size_t i = 2; i + 2 < n; i++) {
+                if (p[i] != prevA6[i]) {
+                  snprintf(tmp, sizeof(tmp), " p[%u]:%02X->%02X", (unsigned) i, prevA6[i], p[i]);
+                  d += tmp;
+                }
+              }
+              bool own = (millis() - last_tx) < 150;   // echo of our own transmitted frame
+              ESP_LOGI("remote", "A6 changed (+%u ms since previous change)%s:%s | K=%02X raw=[%s]",
+                       (unsigned) (millis() - lastA6change), own ? " [own TX echo]" : "", d.c_str(), K,
+                       hexs(f.data(), n).c_str());
+              ESP_LOGI("remote", "A6 p=[%s]", hexs(&p[2], n - 4).c_str());
+              prevA6 = p;
+              lastA6change = millis();
+            }
+          }
+
+          // --- heater frame diff / screen data (noisy bytes masked); A6 is handled by the listener above ---
+          if (LOG_DIFF && is6A) {
+            std::vector<uint8_t> q = p;
+            q[6] &= 0xFE;  q[8] = 0;  q[14] &= 0xFE;  q[n - 3] = 0;
+            int t = isA6 ? 0 : 1;
+            if (q != prev[t]) {
+              std::string d; char tmp[24];
+              if (q.size() == prev[t].size()) {
+                for (size_t i = 2; i + 2 < n; i++) {
+                  if (q[i] != prev[t][i]) {
+                    snprintf(tmp, sizeof(tmp), " p[%u]:%02X->%02X", (unsigned) i, prev[t][i], q[i]);
+                    d += tmp;
+                  }
+                }
+              } else {
+                d = " (первый кадр)";
+              }
+              ESP_LOGI("proto", "%s p=[%s] diff:%s", isA6 ? "A6" : "6A", hexs(&p[2], n - 4).c_str(), d.c_str());
+              prev[t] = q;
+            }
+          }
+
+          // --- публикация данных (кадр котла) ---
+          if (is6A) {
+            static int ls = -1, le = -1, l19 = -1, l25 = -1, l21 = -1, l6 = -1, l10 = -1, lfan = -1;
+            static uint32_t ls_since = 0;
+
+            auto state_name = [](int c) -> std::string {
+              switch (c) {
+                case 0: return "OFF";
+                case 1: return "ON";
+                case 2: return "Process starting...";
+                case 3: return "Trying to burn it up again..";
+                case 172: return "Manual pump / fuel priming";   // tentative: state seen in the manual pump/fuel modes
+                case 4: return "Burn-up completed successfully.";
+                case 5: return "Heater operating normally.";
+                case 7: return "Stopping, cooling down...";
+                case 8: return "OFF";
+                default: return "Unknown (" + std::to_string(c) + ")";
+              }
+            };
+
+            // состояние + лог смены с отметкой времени
+            if (p[3] != ls) {
+              uint32_t now = millis();
+              auto tm = id(ha_time).now();
+              std::string ts = tm.is_valid() ? tm.strftime("%H:%M:%S") : std::string("--:--:--");
+              if (ls < 0) {
+                ESP_LOGI("state", "%s первое значение p[3]=%d (%s) | V=%.1f T19=%d T25=%d p10=%d",
+                         ts.c_str(), (int) p[3], state_name(p[3]).c_str(),
+                         p[6] * 0.1f, (int) p[19], (int) p[25], (int) p[10]);
+              } else {
+                ESP_LOGI("state", "%s p[3]: %d (%s) -> %d (%s), прошлое состояние %.1f с | V=%.1f T19=%d T25=%d p10=%d",
+                         ts.c_str(), ls, state_name(ls).c_str(), (int) p[3], state_name(p[3]).c_str(),
+                         (now - ls_since) / 1000.0f,
+                         p[6] * 0.1f, (int) p[19], (int) p[25], (int) p[10]);
+              }
+              ls = p[3];
+              ls_since = now;
+              id(heater_state).publish_state(state_name(ls));
+            }
+
+            // ошибка: значение p[4] = номер E-xx + 1 (0 = ожидание, 1 = ошибок нет)
+            if (p[4] != le) {
+              le = p[4];
+              static const char *const ERR[14] = {
+                "Supply undervoltage",
+                "The power overvoltage",
+                "Ignition plug fault",
+                "Oil pump failure",
+                "The machine is overheating",
+                "Fan motor fault",
+                "Communication failure",
+                "The flame is extinguished",
+                "The flame temperature sensor is faulty",
+                "Ignition failure",
+                "The water circulating pump is fault",
+                "Poor circulation in waterways",
+                "Water temperature sensor fault",
+                "The heating temperature sensor is faulty"};
+              std::string en;
+              if (le == 0) {
+                en = "Standby";
+              } else if (le == 1) {
+                en = "No error";
+              } else if (le >= 2 && le <= 15) {
+                char eb[80];
+                snprintf(eb, sizeof(eb), "E-%02d: %s", le - 1, ERR[le - 2]);
+                en = eb;
+              } else {
+                char eb[40];
+                snprintf(eb, sizeof(eb), "E-%02d (code %d)", le - 1, le);
+                en = eb;
+              }
+              ESP_LOGI("error", "p[4]=%d -> %s", le, en.c_str());
+              id(heater_error).publish_state(en);
+            }
+
+            if (p[19] != l19) { l19 = p[19]; id(heater_current_temp).publish_state(l19); }
+            if (p[25] != l25) { l25 = p[25]; id(heater_backflow_temp).publish_state(l25); }
+            if (p[21] != l21) { l21 = p[21]; id(heater_flame_temp).publish_state(l21); }
+            // остаток таймера: обратный отсчёт p[26] только в состоянии 5, иначе значение неизвестно
+            {
+              static int l26 = -2;
+              int rem = (p[3] == 5) ? (int) p[26] : -1;
+              if (rem != l26) { l26 = rem; id(heater_timer_remaining).publish_state(rem < 0 ? NAN : (float) rem); }
+            }
+            if (p[6]  != l6)  { l6  = p[6];  id(heater_voltage).publish_state(l6 * 0.1f); }
+            if (p[10] != l10) {
+              l10 = p[10];
+              float pct = l10 * 100.0f / 78.0f;     // 0 -> 0 %, 78 -> 100 %
+              if (pct > 100.0f) pct = 100.0f;
+              id(heater_vent_speed).publish_state(pct);
+            }
+            int fan = p[7] * 256 + p[8];
+            if (fan != lfan) { lfan = fan; id(heater_fan_raw).publish_state(fan); }
+          }
+
+          // --- отправка команды: сразу после ответа котла, в паузе до следующего кадра пульта ---
+          if (is6A && id(g_tx_left) > 0) {
+            if (millis() - id(g_tx_t0) > 8000) {
+              ESP_LOGW("tx", "команда 0x%02X отменена по таймауту (нет спокойного кадра пульта?)", id(g_tx_cmd));
+              id(g_tx_left) = 0; id(g_tx_cmd) = 0;
+            } else if (millis() - last_tx < 200) {
+              // это ответ котла на наш кадр: не отвечаем на него
+            } else if (calm.size() == 26) {
+              delay(${tx_delay_ms});
+              uint8_t out[26];
+              out[0] = 0xA6; out[1] = 24;
+              for (size_t i = 2; i < 24; i++) {
+                uint8_t v = calm[i];
+                if (i == 3) v = (uint8_t) id(g_tx_cmd);
+                // Start: подставляем передачу и таймер из слайдеров HA
+                if (i == 16 && id(g_tx_cmd) == 0x5A && !std::isnan(id(heater_gear_set).state)) v = (uint8_t) id(heater_gear_set).state;
+                if (i == 17 && id(g_tx_cmd) == 0x5A && !std::isnan(id(heater_timer_set).state)) v = (uint8_t) id(heater_timer_set).state;
+                out[i] = v ^ calmK;
+              }
+              uint16_t c = crc16(out, 24);
+              out[24] = c >> 8; out[25] = c & 0xFF;
+              id(bus).write_array(out, 26);
+              last_tx = millis();
+              id(g_tx_left)--;
+              ESP_LOGI("tx", "отправлен кадр cmd=0x%02X K=%02X, осталось %d [%s]",
+                       id(g_tx_cmd), calmK, id(g_tx_left), hexs(out, 26).c_str());
+              if (id(g_tx_left) == 0) id(g_tx_cmd) = 0;
+            }
+          }
+
+          if (good % 100 == 0)
+            ESP_LOGI("proto", "кадров=%u ok=%u", (unsigned) total, (unsigned) good);
+          f.clear();

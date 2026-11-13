@@ -24,11 +24,12 @@ decodes every frame and can inject start/stop commands while the physical switch
 
 ## Features
 - Sensors: supply voltage, vent (fan) speed %, coolant temperature, return (back-flow) temperature,
-  flame temperature.
+  flame temperature, **Timer remaining** (minutes, only while the heater is running).
 - Text sensors: state (OFF / ON / Process starting / Burn-up completed / Operating normally /
   Stopping, cooling down) and error (E-01 … E-14 with the manual's wording).
 - Controls: **Heater Control Enable** switch (always OFF after boot), **Heater Start**, **Heater Stop**.
-  Start is accepted only when the heater is OFF with no error; Stop is always accepted.
+  Start is accepted only when the heater is OFF (a latched error such as E-10 does not block it; the heater clears it on ON, but find the cause before retrying); Stop is always accepted.
+- Settings sent with Start: **Heater Gear** slider (1–9) and **Heater Timer** slider (0–90 min, step 10; 0 is probably "no timer"). They only apply at start; the remote keeps its own values.
 - Works alongside the original remote.
 
 ## Hardware

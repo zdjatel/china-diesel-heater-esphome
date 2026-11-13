@@ -22,7 +22,7 @@ wifi:
   power_save_mode: none
 
 logger:
-  level: INFO
+  level: DEBUG
 
 globals:
   - id: g_tx_cmd        # 0 = none, 0x5A = ON, 0x5C = OFF
@@ -59,6 +59,11 @@ switch:
     restore_mode: ALWAYS_OFF   # control is always disabled after a reboot
 
 button:
+  - platform: restart
+    name: "Heater ESP32 Restart"
+    icon: mdi:restart
+    entity_category: diagnostic
+
   - platform: template
     name: "Heater Start"
     icon: mdi:fire
@@ -68,8 +73,9 @@ button:
             ESP_LOGW("tx", "START rejected: Heater Control Enable is off");
             return;
           }
-          if (!((id(g_state) == 0 || id(g_state) == 8) && (id(g_err) == 0 || id(g_err) == 1))) {
-            ESP_LOGW("tx", "START rejected: state %d, error %d", id(g_state), id(g_err));
+          // a latched error (e.g. E-10) does not block START: the heater clears it on ON
+          if (!(id(g_state) == 0 || id(g_state) == 8)) {
+            ESP_LOGW("tx", "START rejected: heater is not OFF (state %d)", id(g_state));
             return;
           }
           id(g_tx_cmd) = 0x5A;
@@ -85,6 +91,34 @@ button:
           id(g_tx_cmd) = 0x5C;
           id(g_tx_left) = ${tx_repeats};
           id(g_tx_t0) = millis();
+
+number:
+  - platform: template
+    id: heater_gear_set
+    name: "Heater Gear"
+    icon: mdi:gauge
+    # gear (1..9), sent with Start
+    min_value: 1
+    max_value: 9
+    step: 1
+    mode: slider
+    optimistic: true
+    restore_value: true
+    initial_value: 5
+
+  - platform: template
+    id: heater_timer_set
+    name: "Heater Timer"
+    icon: mdi:timer-outline
+    # timer, minutes (0..90, step 10), sent with Start
+    unit_of_measurement: "min"
+    min_value: 0
+    max_value: 90
+    step: 10
+    mode: slider
+    optimistic: true
+    restore_value: true
+    initial_value: 40
 
 sensor:
   - platform: template
@@ -125,6 +159,15 @@ sensor:
     device_class: temperature
     state_class: measurement
     accuracy_decimals: 0
+
+  - platform: template
+    id: heater_timer_remaining
+    name: "Heater Timer remaining"
+    unit_of_measurement: "min"
+    device_class: duration
+    state_class: measurement
+    accuracy_decimals: 0
+    icon: mdi:timer-sand
 
   - platform: wifi_signal
     name: "Heater WiFi signal"
@@ -212,12 +255,16 @@ interval:
           static int ls = -1, le = -1, l19 = -1, l25 = -1, l21 = -1, l6 = -1, l10 = -1;
 
           if (p[3] != ls) {
+            ESP_LOGI("state", "p[3] %d -> %d | vent p10=%d flame=%d coolant=%d return=%d V=%.1f",
+                     ls, (int) p[3], (int) p[10], (int) p[21], (int) p[19], (int) p[25], p[6] * 0.1f);
             ls = p[3];
             const char *s;
             switch (ls) {
               case 0: case 8: s = "OFF"; break;
               case 1: s = "ON"; break;
               case 2: s = "Process starting..."; break;
+              case 3: s = "Trying to burn it up again.."; break;
+              case 172: s = "Manual pump / fuel priming"; break;   // tentative: seen in the manual pump/fuel modes
               case 4: s = "Burn-up completed successfully."; break;
               case 5: s = "Heater operating normally."; break;
               case 7: s = "Stopping, cooling down..."; break;
@@ -246,6 +293,12 @@ interval:
           if (p[19] != l19) { l19 = p[19]; id(heater_current_temp).publish_state(l19); }
           if (p[25] != l25) { l25 = p[25]; id(heater_backflow_temp).publish_state(l25); }
           if (p[21] != l21) { l21 = p[21]; id(heater_flame_temp).publish_state(l21); }
+          // remaining timer: p[26] counts down only in state 5, otherwise unknown
+          {
+            static int l26 = -2;
+            int rem = (p[3] == 5) ? (int) p[26] : -1;
+            if (rem != l26) { l26 = rem; id(heater_timer_remaining).publish_state(rem < 0 ? NAN : (float) rem); }
+          }
           if (p[6]  != l6)  { l6  = p[6];  id(heater_voltage).publish_state(l6 * 0.1f); }
           if (p[10] != l10) {
             l10 = p[10];
@@ -264,8 +317,14 @@ interval:
               delay(${tx_delay_ms});
               uint8_t out[26];
               out[0] = 0xA6; out[1] = 24;
-              for (size_t i = 2; i < 24; i++)
-                out[i] = ((i == 3) ? (uint8_t) id(g_tx_cmd) : calm[i]) ^ calmK;
+              for (size_t i = 2; i < 24; i++) {
+                uint8_t v = calm[i];
+                if (i == 3) v = (uint8_t) id(g_tx_cmd);
+                // Start: use gear and timer from the HA sliders
+                if (i == 16 && id(g_tx_cmd) == 0x5A && !std::isnan(id(heater_gear_set).state)) v = (uint8_t) id(heater_gear_set).state;
+                if (i == 17 && id(g_tx_cmd) == 0x5A && !std::isnan(id(heater_timer_set).state)) v = (uint8_t) id(heater_timer_set).state;
+                out[i] = v ^ calmK;
+              }
               uint16_t c = crc16(out, 24);
               out[24] = c >> 8; out[25] = c & 0xFF;
               id(bus).write_array(out, 26);
